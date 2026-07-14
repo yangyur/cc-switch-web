@@ -5,21 +5,35 @@ interface UseModelStateProps {
   onConfigChange: (config: string) => void;
 }
 
-const ONE_M_MARKER_PATTERN = /\s*\[1m\]\s*$/i;
+export type ClaudeModelEnvField =
+  | "ANTHROPIC_MODEL"
+  | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+  | "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"
+  | "ANTHROPIC_DEFAULT_SONNET_MODEL"
+  | "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"
+  | "ANTHROPIC_DEFAULT_OPUS_MODEL"
+  | "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"
+  | "ANTHROPIC_DEFAULT_FABLE_MODEL"
+  | "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"
+  | "CLAUDE_CODE_SUBAGENT_MODEL";
 
-export const hasClaudeOneMMarker = (value: string): boolean =>
-  ONE_M_MARKER_PATTERN.test(value);
+export const CLAUDE_ONE_M_MARKER = "[1M]";
 
-export const stripClaudeOneMMarker = (value: string): string =>
-  value.replace(ONE_M_MARKER_PATTERN, "").trim();
+export function hasClaudeOneMMarker(model: string): boolean {
+  return model.trimEnd().toLowerCase().endsWith("[1m]");
+}
 
-export const setClaudeOneMMarker = (
-  value: string,
-  enabled: boolean,
-): string => {
-  const stripped = stripClaudeOneMMarker(value);
-  return enabled && stripped ? `${stripped}[1M]` : stripped;
-};
+export function stripClaudeOneMMarker(model: string): string {
+  const trimmedEnd = model.trimEnd();
+  if (!trimmedEnd.toLowerCase().endsWith("[1m]")) return model;
+  return trimmedEnd.slice(0, -CLAUDE_ONE_M_MARKER.length).trimEnd();
+}
+
+export function setClaudeOneMMarker(model: string, enabled: boolean): string {
+  const base = stripClaudeOneMMarker(model).trim();
+  if (!base) return "";
+  return enabled ? `${base}${CLAUDE_ONE_M_MARKER}` : base;
+}
 
 /**
  * Parse model values from settings config JSON
@@ -38,28 +52,53 @@ function parseModelsFromConfig(settingsConfig: string) {
       typeof env.ANTHROPIC_DEFAULT_HAIKU_MODEL === "string"
         ? env.ANTHROPIC_DEFAULT_HAIKU_MODEL
         : small || model;
-    const sonnet =
-      typeof env.ANTHROPIC_DEFAULT_SONNET_MODEL === "string"
-        ? env.ANTHROPIC_DEFAULT_SONNET_MODEL
-        : model || small;
-    const opus =
-      typeof env.ANTHROPIC_DEFAULT_OPUS_MODEL === "string"
-        ? env.ANTHROPIC_DEFAULT_OPUS_MODEL
-        : model || small;
     const haikuName =
       typeof env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME === "string"
         ? env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
         : stripClaudeOneMMarker(haiku);
+    const sonnet =
+      typeof env.ANTHROPIC_DEFAULT_SONNET_MODEL === "string"
+        ? env.ANTHROPIC_DEFAULT_SONNET_MODEL
+        : model || small;
     const sonnetName =
       typeof env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME === "string"
         ? env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
         : stripClaudeOneMMarker(sonnet);
+    const opus =
+      typeof env.ANTHROPIC_DEFAULT_OPUS_MODEL === "string"
+        ? env.ANTHROPIC_DEFAULT_OPUS_MODEL
+        : model || small;
     const opusName =
       typeof env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME === "string"
         ? env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
         : stripClaudeOneMMarker(opus);
+    // 回填链镜像运行时映射链（fable → opus → default），保证 UI 展示
+    // 与代理实际转发的模型一致。
+    const fable =
+      typeof env.ANTHROPIC_DEFAULT_FABLE_MODEL === "string"
+        ? env.ANTHROPIC_DEFAULT_FABLE_MODEL
+        : opus;
+    const fableName =
+      typeof env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME === "string"
+        ? env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+        : stripClaudeOneMMarker(fable);
+    const subagent =
+      typeof env.CLAUDE_CODE_SUBAGENT_MODEL === "string"
+        ? env.CLAUDE_CODE_SUBAGENT_MODEL
+        : "";
 
-    return { model, haiku, haikuName, sonnet, sonnetName, opus, opusName };
+    return {
+      model,
+      haiku,
+      haikuName,
+      sonnet,
+      sonnetName,
+      opus,
+      opusName,
+      fable,
+      fableName,
+      subagent,
+    };
   } catch {
     return {
       model: "",
@@ -69,6 +108,9 @@ function parseModelsFromConfig(settingsConfig: string) {
       sonnetName: "",
       opus: "",
       opusName: "",
+      fable: "",
+      fableName: "",
+      subagent: "",
     };
   }
 }
@@ -81,28 +123,25 @@ export function useModelState({
   settingsConfig,
   onConfigChange,
 }: UseModelStateProps) {
-  // Initialize state by parsing config directly (fixes edit mode backfill)
-  const [claudeModel, setClaudeModel] = useState(
-    () => parseModelsFromConfig(settingsConfig).model,
-  );
-  const [defaultHaikuModel, setDefaultHaikuModel] = useState(
-    () => parseModelsFromConfig(settingsConfig).haiku,
-  );
+  const initial = useState(() => parseModelsFromConfig(settingsConfig))[0];
+  const [claudeModel, setClaudeModel] = useState(initial.model);
+  const [defaultHaikuModel, setDefaultHaikuModel] = useState(initial.haiku);
   const [defaultHaikuModelName, setDefaultHaikuModelName] = useState(
-    () => parseModelsFromConfig(settingsConfig).haikuName,
+    initial.haikuName,
   );
-  const [defaultSonnetModel, setDefaultSonnetModel] = useState(
-    () => parseModelsFromConfig(settingsConfig).sonnet,
-  );
+  const [defaultSonnetModel, setDefaultSonnetModel] = useState(initial.sonnet);
   const [defaultSonnetModelName, setDefaultSonnetModelName] = useState(
-    () => parseModelsFromConfig(settingsConfig).sonnetName,
+    initial.sonnetName,
   );
-  const [defaultOpusModel, setDefaultOpusModel] = useState(
-    () => parseModelsFromConfig(settingsConfig).opus,
-  );
+  const [defaultOpusModel, setDefaultOpusModel] = useState(initial.opus);
   const [defaultOpusModelName, setDefaultOpusModelName] = useState(
-    () => parseModelsFromConfig(settingsConfig).opusName,
+    initial.opusName,
   );
+  const [defaultFableModel, setDefaultFableModel] = useState(initial.fable);
+  const [defaultFableModelName, setDefaultFableModelName] = useState(
+    initial.fableName,
+  );
+  const [subagentModel, setSubagentModel] = useState(initial.subagent);
 
   const isUserEditingRef = useRef(false);
   const lastConfigRef = useRef(settingsConfig);
@@ -110,82 +149,34 @@ export function useModelState({
 
   latestConfigRef.current = settingsConfig;
 
-  // 初始化读取：读新键；若缺失，按兼容优先级回退
-  // Haiku: DEFAULT_HAIKU || SMALL_FAST || MODEL
-  // Sonnet: DEFAULT_SONNET || MODEL || SMALL_FAST
-  // Opus: DEFAULT_OPUS || MODEL || SMALL_FAST
-  // 仅在 settingsConfig 变化时同步一次（表单加载/切换预设时）
+  // 仅在 settingsConfig 外部变化时同步（表单加载 / 切换预设）；
+  // 用户正在编辑时 (isUserEditingRef) 跳过一次以避免回填覆盖。
   useEffect(() => {
     if (lastConfigRef.current === settingsConfig) {
       return;
     }
-
     if (isUserEditingRef.current) {
       isUserEditingRef.current = false;
       lastConfigRef.current = settingsConfig;
       return;
     }
-
     lastConfigRef.current = settingsConfig;
 
-    try {
-      const cfg = settingsConfig ? JSON.parse(settingsConfig) : {};
-      const env = cfg?.env || {};
-      const model =
-        typeof env.ANTHROPIC_MODEL === "string" ? env.ANTHROPIC_MODEL : "";
-      const small =
-        typeof env.ANTHROPIC_SMALL_FAST_MODEL === "string"
-          ? env.ANTHROPIC_SMALL_FAST_MODEL
-          : "";
-      const haiku =
-        typeof env.ANTHROPIC_DEFAULT_HAIKU_MODEL === "string"
-          ? env.ANTHROPIC_DEFAULT_HAIKU_MODEL
-          : small || model;
-      const sonnet =
-        typeof env.ANTHROPIC_DEFAULT_SONNET_MODEL === "string"
-          ? env.ANTHROPIC_DEFAULT_SONNET_MODEL
-          : model || small;
-      const opus =
-        typeof env.ANTHROPIC_DEFAULT_OPUS_MODEL === "string"
-          ? env.ANTHROPIC_DEFAULT_OPUS_MODEL
-          : model || small;
-      const haikuName =
-        typeof env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME === "string"
-          ? env.ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME
-          : stripClaudeOneMMarker(haiku);
-      const sonnetName =
-        typeof env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME === "string"
-          ? env.ANTHROPIC_DEFAULT_SONNET_MODEL_NAME
-          : stripClaudeOneMMarker(sonnet);
-      const opusName =
-        typeof env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME === "string"
-          ? env.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME
-          : stripClaudeOneMMarker(opus);
-
-      setClaudeModel(model || "");
-      setDefaultHaikuModel(haiku || "");
-      setDefaultHaikuModelName(haikuName || "");
-      setDefaultSonnetModel(sonnet || "");
-      setDefaultSonnetModelName(sonnetName || "");
-      setDefaultOpusModel(opus || "");
-      setDefaultOpusModelName(opusName || "");
-    } catch {
-      // ignore
-    }
+    const parsed = parseModelsFromConfig(settingsConfig);
+    setClaudeModel(parsed.model);
+    setDefaultHaikuModel(parsed.haiku);
+    setDefaultHaikuModelName(parsed.haikuName);
+    setDefaultSonnetModel(parsed.sonnet);
+    setDefaultSonnetModelName(parsed.sonnetName);
+    setDefaultOpusModel(parsed.opus);
+    setDefaultOpusModelName(parsed.opusName);
+    setDefaultFableModel(parsed.fable);
+    setDefaultFableModelName(parsed.fableName);
+    setSubagentModel(parsed.subagent);
   }, [settingsConfig]);
 
   const handleModelChange = useCallback(
-    (
-      field:
-        | "ANTHROPIC_MODEL"
-        | "ANTHROPIC_DEFAULT_HAIKU_MODEL"
-        | "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"
-        | "ANTHROPIC_DEFAULT_SONNET_MODEL"
-        | "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"
-        | "ANTHROPIC_DEFAULT_OPUS_MODEL"
-        | "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
-      value: string,
-    ) => {
+    (field: ClaudeModelEnvField, value: string) => {
       isUserEditingRef.current = true;
 
       if (field === "ANTHROPIC_MODEL") setClaudeModel(value);
@@ -200,6 +191,11 @@ export function useModelState({
       if (field === "ANTHROPIC_DEFAULT_OPUS_MODEL") setDefaultOpusModel(value);
       if (field === "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")
         setDefaultOpusModelName(value);
+      if (field === "ANTHROPIC_DEFAULT_FABLE_MODEL")
+        setDefaultFableModel(value);
+      if (field === "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME")
+        setDefaultFableModelName(value);
+      if (field === "CLAUDE_CODE_SUBAGENT_MODEL") setSubagentModel(value);
 
       try {
         const currentConfig = latestConfigRef.current
@@ -243,6 +239,12 @@ export function useModelState({
     setDefaultOpusModel,
     defaultOpusModelName,
     setDefaultOpusModelName,
+    defaultFableModel,
+    setDefaultFableModel,
+    defaultFableModelName,
+    setDefaultFableModelName,
+    subagentModel,
+    setSubagentModel,
     handleModelChange,
   };
 }

@@ -10,7 +10,7 @@ use futures::{stream::Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::sync::{Once, OnceLock};
+use std::sync::OnceLock;
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -55,20 +55,10 @@ type HyperClient = Client<
     http_body_util::Full<Bytes>,
 >;
 
-fn ensure_rustls_crypto_provider_installed() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        // 合并后新增的 hyper/tokio-rustls 路径不会自动选中进程级 CryptoProvider。
-        // Web/headless 模式一旦进入 TLS 转发，这里必须先显式安装 provider，避免运行时 panic。
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 /// Lazily-initialized hyper client with header-case preservation enabled.
 fn global_hyper_client() -> &'static HyperClient {
     static CLIENT: OnceLock<HyperClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        ensure_rustls_crypto_provider_installed();
         let connector = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -149,6 +139,21 @@ impl ProxyResponse {
     pub fn is_sse(&self) -> bool {
         self.content_type()
             .map(|ct| ct.contains("text/event-stream"))
+            .unwrap_or(false)
+    }
+
+    /// Check whether the response explicitly declares a JSON media type.
+    pub fn is_json(&self) -> bool {
+        self.content_type()
+            .map(|content_type| {
+                let media_type = content_type
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                media_type == "application/json" || media_type.ends_with("+json")
+            })
             .unwrap_or(false)
     }
 
@@ -559,7 +564,6 @@ async fn connect_via_proxy(
 fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
     static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
     CONNECTOR.get_or_init(|| {
-        ensure_rustls_crypto_provider_installed();
         let mut root_store = rustls::RootCertStore::empty();
         // Baseline: Mozilla/webpki roots
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -572,18 +576,6 @@ fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
             .with_no_client_auth();
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tls_helpers_install_crypto_provider_without_panicking() {
-        ensure_rustls_crypto_provider_installed();
-        let _ = global_hyper_client();
-        let _ = global_tls_connector();
-    }
 }
 
 /// Build raw HTTP/1.1 request bytes with original header casing.
@@ -758,5 +750,29 @@ impl<S: Unpin> tokio::io::AsyncWrite for WriteFilter<S> {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffered_with_content_type(content_type: Option<&str>) -> ProxyResponse {
+        let mut headers = http::HeaderMap::new();
+        if let Some(content_type) = content_type {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_str(content_type).unwrap(),
+            );
+        }
+        ProxyResponse::buffered(http::StatusCode::OK, headers, Bytes::new())
+    }
+
+    #[test]
+    fn json_content_type_detection_accepts_json_suffixes() {
+        assert!(buffered_with_content_type(Some("application/json; charset=utf-8")).is_json());
+        assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
+        assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
+        assert!(!buffered_with_content_type(None).is_json());
     }
 }

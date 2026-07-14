@@ -5,6 +5,9 @@ import { exit } from "@tauri-apps/plugin-process";
 export interface ConfigLoadErrorPayload {
   path?: string;
   error?: string;
+  kind?: string;
+  db_version?: number;
+  supported_version?: number;
 }
 
 export async function handleFatalConfigLoadError(

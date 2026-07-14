@@ -18,6 +18,7 @@ mod global_proxy;
 mod hermes;
 #[cfg(feature = "desktop")]
 mod import_export;
+#[cfg(feature = "desktop")]
 mod lightweight;
 #[cfg(feature = "desktop")]
 mod mcp;
@@ -27,11 +28,15 @@ mod omo;
 mod openclaw;
 mod plugin;
 #[cfg(feature = "desktop")]
+mod profile;
+#[cfg(feature = "desktop")]
 mod prompt;
 #[cfg(feature = "desktop")]
 mod provider;
 #[cfg(feature = "desktop")]
 mod proxy;
+#[cfg(feature = "desktop")]
+mod s3_sync;
 mod session_manager;
 #[cfg(feature = "desktop")]
 mod settings;
@@ -65,6 +70,7 @@ pub use global_proxy::*;
 pub use hermes::*;
 #[cfg(feature = "desktop")]
 pub use import_export::*;
+#[cfg(feature = "desktop")]
 pub use lightweight::*;
 #[cfg(feature = "desktop")]
 pub use mcp::*;
@@ -74,11 +80,15 @@ pub use omo::*;
 pub use openclaw::*;
 pub use plugin::*;
 #[cfg(feature = "desktop")]
+pub use profile::*;
+#[cfg(feature = "desktop")]
 pub use prompt::*;
 #[cfg(feature = "desktop")]
 pub use provider::*;
 #[cfg(feature = "desktop")]
 pub use proxy::*;
+#[cfg(feature = "desktop")]
+pub use s3_sync::*;
 pub use session_manager::*;
 #[cfg(feature = "desktop")]
 pub use settings::*;

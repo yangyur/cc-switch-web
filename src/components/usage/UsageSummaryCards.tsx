@@ -24,7 +24,7 @@ export function UsageSummaryCards({
     data: summary,
     isLoading,
     error,
-  } = useUsageSummary(range, appType, {
+  } = useUsageSummary(range, appType ? { appType } : undefined, {
     refetchInterval: refreshIntervalMs > 0 ? refreshIntervalMs : false,
   });
 

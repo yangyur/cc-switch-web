@@ -14,10 +14,12 @@ use std::{
     time::Duration,
 };
 
+pub use cc_switch::HeadlessStatusCallback as S3AutoSyncStatusCallback;
+pub use cc_switch::S3SyncSettings;
 use cc_switch::{
     default_sql_export_file_name, export_database_sql, export_database_to_file, AppError,
-    AppSettings, AppState, AppType, Database, EndpointLatency, McpServer, Provider,
-    ProviderService, SkillService, SpeedtestService,
+    AppSettings, AppState, AppType, Database, EndpointLatency, McpServer, ProfilePayload,
+    ProfileScope, ProfileService, Provider, ProviderService, SkillService, SpeedtestService,
 };
 use chrono::Utc;
 use indexmap::IndexMap;
@@ -38,12 +40,15 @@ pub use cc_switch::{
     SkillBackupEntry, SkillMigrationResult, SkillRepo, SkillStorageLocation, SkillUpdateInfo,
     SkillsMigrationPayload, SkillsShSearchResult, StreamCheckConfig, StreamCheckResult,
     StreamCheckService, SubscriptionQuota, UniversalProvider, UsageResult, UsageSummary,
-    UsageSummaryByApp,
-    WebDavSyncSettings, WslShellPreferenceInput, WEB_COMPAT_TAURI_COMMANDS,
+    UsageSummaryByApp, WebDavSyncSettings, WslShellPreferenceInput, WEB_COMPAT_TAURI_COMMANDS,
 };
 
 const AUTH_PROVIDER_GITHUB_COPILOT: &str = "github_copilot";
 const AUTH_PROVIDER_CODEX_OAUTH: &str = "codex_oauth";
+
+pub fn set_s3_auto_sync_status_callback(callback: S3AutoSyncStatusCallback) {
+    cc_switch::set_s3_auto_sync_status_callback(callback);
+}
 
 /// 核心上下文
 ///
@@ -65,6 +70,7 @@ impl CoreContext {
     pub fn new() -> Result<Self, AppError> {
         let db = Arc::new(Database::init()?);
         let app_state = AppState::new(db);
+        cc_switch::start_s3_auto_sync_worker(app_state.db.clone());
         let app_config_dir = cc_switch::get_app_config_dir();
 
         let skill_service = Some(Arc::new(SkillService::new()));
@@ -85,6 +91,7 @@ impl CoreContext {
     }
 
     pub fn from_app_state(app_state: AppState) -> Self {
+        cc_switch::start_s3_auto_sync_worker(app_state.db.clone());
         let app_config_dir = cc_switch::get_app_config_dir();
         let skill_service = Some(Arc::new(SkillService::new()));
         Self {
@@ -239,6 +246,17 @@ pub fn get_current_provider(ctx: &CoreContext, app: &str) -> Result<String, Stri
     ProviderService::current(ctx.app_state(), app_type).map_err(|e| e.to_string())
 }
 
+pub fn get_effective_current_provider(ctx: &CoreContext, app: &str) -> Result<String, String> {
+    let app_type = AppType::from_str(app).map_err(|e| e.to_string())?;
+    cc_switch::get_effective_current_provider(&ctx.app_state().db, &app_type)
+        .map_err(|e| e.to_string())
+        .map(|provider| provider.unwrap_or_default())
+}
+
+pub fn get_proxy_flags(ctx: &CoreContext, app: &str) -> (bool, bool) {
+    ctx.app_state().db.get_proxy_flags_sync(app)
+}
+
 /// 添加供应商
 pub fn add_provider(ctx: &CoreContext, app: &str, provider: Provider) -> Result<bool, String> {
     let app_type = AppType::from_str(app).map_err(|e| e.to_string())?;
@@ -342,7 +360,7 @@ pub async fn fetch_models_for_config(
     is_full_url: bool,
     models_url: Option<&str>,
 ) -> Result<Vec<FetchedModel>, String> {
-    cc_switch::fetch_models(base_url, api_key, is_full_url, models_url).await
+    cc_switch::fetch_models(base_url, api_key, is_full_url, models_url, None).await
 }
 
 pub async fn get_subscription_quota(tool: &str) -> Result<SubscriptionQuota, String> {
@@ -385,13 +403,13 @@ pub async fn get_codex_oauth_quota(account_id: Option<&str>) -> Result<Subscript
         }
     };
 
-    Ok(cc_switch::query_codex_quota(
+    cc_switch::query_codex_quota(
         &token,
         Some(&id),
         "codex_oauth",
         "Codex OAuth access token expired or rejected. Please re-login via cc-switch.",
     )
-    .await)
+    .await
 }
 
 pub async fn get_codex_oauth_models(account_id: Option<&str>) -> Result<Vec<FetchedModel>, String> {
@@ -415,8 +433,22 @@ pub async fn get_codex_oauth_models(account_id: Option<&str>) -> Result<Vec<Fetc
 pub async fn get_coding_plan_quota(
     base_url: &str,
     api_key: &str,
+    access_key_id: Option<&str>,
+    secret_access_key: Option<&str>,
+    coding_plan_provider: Option<&str>,
+    team_organization_id: Option<&str>,
+    team_project_id: Option<&str>,
 ) -> Result<SubscriptionQuota, String> {
-    cc_switch::fetch_coding_plan_quota(base_url, api_key).await
+    cc_switch::fetch_coding_plan_quota(
+        base_url,
+        api_key,
+        access_key_id,
+        secret_access_key,
+        coding_plan_provider,
+        team_organization_id,
+        team_project_id,
+    )
+    .await
 }
 
 pub async fn get_balance(base_url: &str, api_key: &str) -> Result<UsageResult, String> {
@@ -935,7 +967,7 @@ fn suggested_claude_desktop_routes(
                 route_id.to_string(),
                 cc_switch::ClaudeDesktopModelRoute {
                     model: model.to_string(),
-                    display_name: Some(display_name.to_string()),
+                    label_override: Some(display_name.to_string()),
                     supports_1m: Some(true),
                 },
             );
@@ -943,13 +975,7 @@ fn suggested_claude_desktop_routes(
     }
 
     for spec in cc_switch::DEFAULT_PROXY_ROUTES {
-        add_route(
-            &mut routes,
-            env,
-            spec.route_id,
-            spec.env_key,
-            spec.display_name,
-        );
+        add_route(&mut routes, env, spec.route_id, spec.env_key, spec.route_id);
     }
 
     let primary_route = cc_switch::DEFAULT_PROXY_ROUTES[0];
@@ -959,7 +985,7 @@ fn suggested_claude_desktop_routes(
             env,
             primary_route.route_id,
             "ANTHROPIC_MODEL",
-            primary_route.display_name,
+            primary_route.route_id,
         );
     }
 
@@ -1035,10 +1061,9 @@ pub async fn stream_check_provider(
         .get(provider_id)
         .ok_or_else(|| format!("供应商 {provider_id} 不存在"))?;
 
-    let result =
-        StreamCheckService::check_with_retry(&app_type, provider, &config, None, None, None)
-            .await
-            .map_err(|e| e.to_string())?;
+    let result = StreamCheckService::check_with_retry(&app_type, provider, &config, None)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let _ = ctx.app_state().db.save_stream_check_log(
         provider_id,
@@ -1090,20 +1115,19 @@ pub async fn stream_check_all_providers(
             }
         }
 
-        let result =
-            StreamCheckService::check_with_retry(&app_type, &provider, &config, None, None, None)
-                .await
-                .unwrap_or_else(|e| StreamCheckResult {
-                    status: HealthStatus::Failed,
-                    success: false,
-                    message: e.to_string(),
-                    response_time_ms: None,
-                    http_status: None,
-                    model_used: String::new(),
-                    tested_at: Utc::now().timestamp(),
-                    retry_count: 0,
-                    error_category: None,
-                });
+        let result = StreamCheckService::check_with_retry(&app_type, &provider, &config, None)
+            .await
+            .unwrap_or_else(|e| StreamCheckResult {
+                status: HealthStatus::Failed,
+                success: false,
+                message: e.to_string(),
+                response_time_ms: None,
+                http_status: None,
+                model_used: String::new(),
+                tested_at: Utc::now().timestamp(),
+                retry_count: 0,
+                error_category: None,
+            });
 
         let _ = ctx.app_state().db.save_stream_check_log(
             &id,
@@ -1143,7 +1167,7 @@ pub fn get_usage_summary(
 ) -> Result<UsageSummary, String> {
     ctx.app_state()
         .db
-        .get_usage_summary(start_date, end_date, app_type)
+        .get_usage_summary(start_date, end_date, app_type, None, None)
         .map_err(|e| e.to_string())
 }
 
@@ -1154,7 +1178,7 @@ pub fn get_usage_summary_by_app(
 ) -> Result<Vec<UsageSummaryByApp>, String> {
     ctx.app_state()
         .db
-        .get_usage_summary_by_app(start_date, end_date)
+        .get_usage_summary_by_app(start_date, end_date, None, None)
         .map_err(|e| e.to_string())
 }
 
@@ -1166,7 +1190,7 @@ pub fn get_usage_trends(
 ) -> Result<Vec<DailyStats>, String> {
     ctx.app_state()
         .db
-        .get_daily_trends(start_date, end_date, app_type)
+        .get_daily_trends(start_date, end_date, app_type, None, None)
         .map_err(|e| e.to_string())
 }
 
@@ -1178,7 +1202,7 @@ pub fn get_provider_stats(
 ) -> Result<Vec<ProviderStats>, String> {
     ctx.app_state()
         .db
-        .get_provider_stats(start_date, end_date, app_type)
+        .get_provider_stats(start_date, end_date, app_type, None, None)
         .map_err(|e| e.to_string())
 }
 
@@ -1190,7 +1214,7 @@ pub fn get_model_stats(
 ) -> Result<Vec<ModelStats>, String> {
     ctx.app_state()
         .db
-        .get_model_stats(start_date, end_date, app_type)
+        .get_model_stats(start_date, end_date, app_type, None, None)
         .map_err(|e| e.to_string())
 }
 
@@ -1217,8 +1241,8 @@ pub fn get_request_detail(
 }
 
 pub fn sync_session_usage(ctx: &CoreContext) -> Result<SessionSyncResult, String> {
-    let result =
-        cc_switch::sync_all_session_usage(ctx.app_state().db.as_ref()).map_err(|e| e.to_string())?;
+    let result = cc_switch::sync_all_session_usage(ctx.app_state().db.as_ref())
+        .map_err(|e| e.to_string())?;
 
     if let Some(error) = result.errors.first() {
         log::warn!(
@@ -1301,19 +1325,297 @@ pub fn update_tray_menu(_ctx: &CoreContext) -> Result<bool, String> {
     Ok(true)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDto {
+    pub id: String,
+    pub name: String,
+    pub payload: ProfilePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+}
+
+impl TryFrom<cc_switch::Profile> for ProfileDto {
+    type Error = String;
+
+    fn try_from(profile: cc_switch::Profile) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: profile.id,
+            name: profile.name,
+            payload: serde_json::from_str(&profile.payload).unwrap_or_default(),
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentProfileIds {
+    pub claude: Option<String>,
+    pub claude_desktop: Option<String>,
+    pub codex: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilesResponse {
+    pub profiles: Vec<ProfileDto>,
+    pub current_ids: CurrentProfileIds,
+}
+
+pub fn ensure_claude_desktop_official_provider(ctx: &CoreContext) -> Result<bool, String> {
+    ctx.app_state()
+        .db
+        .ensure_official_seed_by_id("claude-desktop-official", AppType::ClaudeDesktop)
+        .map_err(|e| e.to_string())
+}
+
+pub fn ensure_codex_official_provider(ctx: &CoreContext) -> Result<bool, String> {
+    ctx.app_state()
+        .db
+        .ensure_official_seed_by_id("codex-official", AppType::Codex)
+        .map_err(|e| e.to_string())
+}
+
+pub fn update_toml_common_config_snippet(
+    config_toml: &str,
+    snippet_toml: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    cc_switch::update_toml_common_config_snippet(config_toml, snippet_toml, enabled)
+        .map_err(|e| e.to_string())
+}
+
+pub fn has_codex_unify_history_backup() -> bool {
+    cc_switch::has_codex_unify_history_backup()
+}
+
+pub async fn restore_codex_unified_history() -> Result<serde_json::Value, String> {
+    let outcome = tokio::task::spawn_blocking(cc_switch::restore_codex_unified_history)
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "restoredJsonlFiles": outcome.restored_jsonl_files,
+        "restoredStateRows": outcome.restored_state_rows,
+        "skippedReason": outcome.skipped_reason,
+    }))
+}
+
+pub fn list_profiles(ctx: &CoreContext) -> Result<ProfilesResponse, String> {
+    let profiles = ProfileService::list(ctx.app_state())?
+        .into_iter()
+        .map(ProfileDto::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let db = &ctx.app_state().db;
+    Ok(ProfilesResponse {
+        profiles,
+        current_ids: CurrentProfileIds {
+            claude: db.get_current_profile_id(ProfileScope::Claude.as_str())?,
+            claude_desktop: db.get_current_profile_id(ProfileScope::ClaudeDesktop.as_str())?,
+            codex: db.get_current_profile_id(ProfileScope::Codex.as_str())?,
+        },
+    })
+}
+
+pub fn create_profile(ctx: &CoreContext, name: &str, scope: &str) -> Result<ProfileDto, String> {
+    let scope = ProfileScope::parse(scope).map_err(|e| e.to_string())?;
+    ProfileService::create(ctx.app_state(), name, scope)
+        .map_err(|e| e.to_string())?
+        .try_into()
+}
+
+pub fn update_profile(
+    ctx: &CoreContext,
+    id: &str,
+    name: Option<String>,
+    resnapshot: bool,
+    scope: Option<&str>,
+) -> Result<ProfileDto, String> {
+    let scope = scope
+        .map(ProfileScope::parse)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    ProfileService::update(ctx.app_state(), id, name, resnapshot, scope)
+        .map_err(|e| e.to_string())?
+        .try_into()
+}
+
+pub fn delete_profile(ctx: &CoreContext, id: &str) -> Result<(), String> {
+    ProfileService::delete(ctx.app_state(), id).map_err(|e| e.to_string())
+}
+
+pub fn clear_current_profile(ctx: &CoreContext, scope: &str) -> Result<(), String> {
+    let scope = ProfileScope::parse(scope).map_err(|e| e.to_string())?;
+    ctx.app_state()
+        .db
+        .set_current_profile_id(scope.as_str(), None)
+        .map_err(|e| e.to_string())
+}
+
+pub async fn apply_profile(
+    ctx: &CoreContext,
+    id: &str,
+    scope: &str,
+) -> Result<(Vec<String>, ProfileScope), String> {
+    let scope = ProfileScope::parse(scope).map_err(|e| e.to_string())?;
+    let id = id.to_string();
+    let state = AppState::new(ctx.app_state().db.clone());
+    let (warnings, should_stop_proxy) = tokio::task::spawn_blocking(move || {
+        ProfileService::apply(&state, &id, scope).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if should_stop_proxy {
+        ctx.app_state().proxy_service.stop().await?;
+    }
+    Ok((warnings, scope))
+}
+
+fn required_s3_settings() -> Result<S3SyncSettings, String> {
+    let settings =
+        cc_switch::get_s3_sync_settings().ok_or_else(|| "S3 sync is not configured".to_string())?;
+    if !settings.enabled {
+        return Err("S3 sync is disabled".to_string());
+    }
+    Ok(settings)
+}
+
+pub async fn s3_test_connection(
+    mut settings: S3SyncSettings,
+    preserve_empty_secret: bool,
+) -> Result<serde_json::Value, String> {
+    if preserve_empty_secret && settings.secret_access_key.is_empty() {
+        if let Some(existing) = cc_switch::get_s3_sync_settings() {
+            settings.secret_access_key = existing.secret_access_key;
+        }
+    }
+    cc_switch::s3_check_connection(&settings)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "success": true, "message": "S3 connection ok" }))
+}
+
+pub async fn s3_sync_upload(ctx: &CoreContext) -> Result<serde_json::Value, String> {
+    let mut settings = required_s3_settings()?;
+    let result = cc_switch::s3_run_with_sync_lock(cc_switch::s3_upload(
+        ctx.app_state().db.as_ref(),
+        &mut settings,
+    ))
+    .await;
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            persist_s3_sync_error(&mut settings, &error, "manual");
+            Err(error.to_string())
+        }
+    }
+}
+
+pub async fn s3_sync_download(ctx: &CoreContext) -> Result<serde_json::Value, String> {
+    let mut settings = required_s3_settings()?;
+    let _suppression = cc_switch::S3AutoSyncSuppressionGuard::new();
+    let download_result = cc_switch::s3_run_with_sync_lock(cc_switch::s3_download(
+        ctx.app_state().db.as_ref(),
+        &mut settings,
+    ))
+    .await;
+    let mut result = match download_result {
+        Ok(value) => value,
+        Err(error) => {
+            persist_s3_sync_error(&mut settings, &error, "manual");
+            return Err(error.to_string());
+        }
+    };
+    let db = ctx.app_state().db.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || cc_switch::sync_post_import(db))
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(object) = result.as_object_mut() {
+            object.insert("warning".to_string(), serde_json::json!(error.to_string()));
+        }
+    }
+    Ok(result)
+}
+
+pub fn s3_sync_save_settings(
+    mut settings: S3SyncSettings,
+    password_touched: bool,
+) -> Result<serde_json::Value, String> {
+    if let Some(existing) = cc_switch::get_s3_sync_settings() {
+        if !password_touched && settings.secret_access_key.is_empty() {
+            settings.secret_access_key = existing.secret_access_key;
+        }
+        settings.status = existing.status;
+    }
+    settings.normalize();
+    settings.validate().map_err(|e| e.to_string())?;
+    cc_switch::set_s3_sync_settings(Some(settings)).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "success": true }))
+}
+
+pub async fn s3_sync_fetch_remote_info() -> Result<serde_json::Value, String> {
+    let settings = required_s3_settings()?;
+    Ok(cc_switch::s3_fetch_remote_info(&settings)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| serde_json::json!({ "empty": true })))
+}
+
 // ========================
 // Settings 相关 API
 // ========================
 
 /// 获取应用设置
 pub fn get_settings() -> AppSettings {
-    cc_switch::get_settings()
+    cc_switch::get_settings_for_frontend()
 }
 
 /// 保存应用设置
-pub fn save_settings(settings: AppSettings) -> Result<bool, String> {
-    cc_switch::update_settings(settings).map_err(|e| e.to_string())?;
-    Ok(true)
+pub async fn save_settings(ctx: &CoreContext, mut settings: AppSettings) -> Result<bool, String> {
+    let db = ctx.app_state().db.clone();
+    tokio::task::spawn_blocking(move || {
+        let existing = cc_switch::get_settings();
+        match (&mut settings.webdav_sync, &existing.webdav_sync) {
+            (None, current) => settings.webdav_sync = current.clone(),
+            (Some(incoming), Some(current)) if incoming.password.is_empty() => {
+                incoming.password = current.password.clone();
+            }
+            _ => {}
+        }
+        match (&mut settings.s3_sync, &existing.s3_sync) {
+            (None, current) => settings.s3_sync = current.clone(),
+            (Some(incoming), Some(current)) if incoming.secret_access_key.is_empty() => {
+                incoming.secret_access_key = current.secret_access_key.clone();
+            }
+            _ => {}
+        }
+        settings.local_migrations = existing.local_migrations.clone();
+        let unify_enabled = settings.unify_codex_session_history;
+        let unify_changed = unify_enabled != existing.unify_codex_session_history;
+        cc_switch::update_settings(settings).map_err(|e| e.to_string())?;
+        if unify_changed {
+            let state = AppState::new(db);
+            if let Err(error) = cc_switch::reapply_current_codex_official_live(&state) {
+                let _ = cc_switch::update_settings(existing);
+                return Err(error.to_string());
+            }
+            std::thread::spawn(move || {
+                if let Err(error) =
+                    cc_switch::apply_codex_history_setting_side_effect(unify_enabled)
+                {
+                    log::warn!("Codex unified history side effect failed: {error}");
+                }
+            });
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 获取整流器配置
@@ -1343,15 +1645,6 @@ pub fn get_optimizer_config(ctx: &CoreContext) -> Result<OptimizerConfig, String
 
 /// 设置优化器配置
 pub fn set_optimizer_config(ctx: &CoreContext, config: OptimizerConfig) -> Result<bool, String> {
-    match config.cache_ttl.as_str() {
-        "5m" | "1h" => {}
-        other => {
-            return Err(format!(
-                "Invalid cache_ttl value: '{other}'. Allowed values: '5m', '1h'"
-            ));
-        }
-    }
-
     ctx.app_state()
         .db
         .set_optimizer_config(&config)
@@ -1676,6 +1969,12 @@ fn resolve_password_for_request(
         }
     }
     incoming
+}
+
+fn persist_s3_sync_error(settings: &mut S3SyncSettings, error: &cc_switch::AppError, source: &str) {
+    settings.status.last_error = Some(error.to_string());
+    settings.status.last_error_source = Some(source.to_string());
+    let _ = cc_switch::update_s3_sync_status(settings.status.clone());
 }
 
 fn persist_sync_error(

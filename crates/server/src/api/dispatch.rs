@@ -23,8 +23,11 @@ rpc_business_methods!(
     "queryProviderUsage",
     "testUsageScript",
     "read_live_provider_settings",
+    "update_toml_common_config_snippet",
     "fetch_models_for_config",
     "import_claude_desktop_providers_from_claude",
+    "ensure_claude_desktop_official_provider",
+    "ensure_codex_official_provider",
     "get_claude_desktop_status",
     "get_claude_desktop_default_routes",
     "auth_start_login",
@@ -107,6 +110,8 @@ rpc_business_methods!(
     "get_pricing_model_source",
     "set_pricing_model_source",
     "get_settings",
+    "has_codex_unify_history_backup",
+    "restore_codex_unified_history",
     "save_settings",
     "get_rectifier_config",
     "set_rectifier_config",
@@ -152,6 +157,11 @@ rpc_business_methods!(
     "webdav_sync_download",
     "webdav_sync_save_settings",
     "webdav_sync_fetch_remote_info",
+    "s3_test_connection",
+    "s3_sync_upload",
+    "s3_sync_download",
+    "s3_sync_save_settings",
+    "s3_sync_fetch_remote_info",
     "get_skills",
     "get_installed_skills",
     "get_skill_backups",
@@ -252,6 +262,12 @@ rpc_business_methods!(
     "upsert_mcp_server",
     "delete_mcp_server",
     "toggle_mcp_app",
+    "list_profiles",
+    "create_profile",
+    "update_profile",
+    "delete_profile",
+    "clear_current_profile",
+    "apply_profile",
     "get_prompts",
     "upsert_prompt",
     "delete_prompt",
@@ -575,6 +591,31 @@ pub async fn dispatch_command(
             serde_json::to_value(models).map_err(|e| RpcError::internal_error(e.to_string()))
         }
 
+        "ensure_claude_desktop_official_provider" => {
+            let inserted = cc_switch_core::ensure_claude_desktop_official_provider(core)
+                .map_err(RpcError::app_error)?;
+            Ok(serde_json::json!(inserted))
+        }
+
+        "ensure_codex_official_provider" => {
+            let inserted = cc_switch_core::ensure_codex_official_provider(core)
+                .map_err(RpcError::app_error)?;
+            Ok(serde_json::json!(inserted))
+        }
+
+        "update_toml_common_config_snippet" => {
+            let config_toml = get_str_param(params, &["configToml", "config_toml"])?;
+            let snippet_toml = get_str_param(params, &["snippetToml", "snippet_toml"])?;
+            let enabled = get_bool_param(params, &["enabled"])?;
+            let updated = cc_switch_core::update_toml_common_config_snippet(
+                config_toml,
+                snippet_toml,
+                enabled,
+            )
+            .map_err(RpcError::app_error)?;
+            Ok(serde_json::json!(updated))
+        }
+
         "import_claude_desktop_providers_from_claude" => {
             let count = cc_switch_core::import_claude_desktop_providers_from_claude(core)
                 .map_err(RpcError::app_error)?;
@@ -823,9 +864,26 @@ pub async fn dispatch_command(
         "get_coding_plan_quota" => {
             let base_url = get_str_param(params, &["baseUrl", "base_url"])?;
             let api_key = get_str_param(params, &["apiKey", "api_key"])?;
-            let quota = cc_switch_core::get_coding_plan_quota(base_url, api_key)
-                .await
-                .map_err(RpcError::app_error)?;
+            let access_key_id = get_optional_str_param(params, &["accessKeyId", "access_key_id"])?;
+            let secret_access_key =
+                get_optional_str_param(params, &["secretAccessKey", "secret_access_key"])?;
+            let coding_plan_provider =
+                get_optional_str_param(params, &["codingPlanProvider", "coding_plan_provider"])?;
+            let team_organization_id =
+                get_optional_str_param(params, &["teamOrganizationId", "team_organization_id"])?;
+            let team_project_id =
+                get_optional_str_param(params, &["teamProjectId", "team_project_id"])?;
+            let quota = cc_switch_core::get_coding_plan_quota(
+                base_url,
+                api_key,
+                access_key_id,
+                secret_access_key,
+                coding_plan_provider,
+                team_organization_id,
+                team_project_id,
+            )
+            .await
+            .map_err(RpcError::app_error)?;
             serde_json::to_value(quota).map_err(|e| RpcError::internal_error(e.to_string()))
         }
 
@@ -1600,6 +1658,14 @@ pub async fn dispatch_command(
             serde_json::to_value(settings).map_err(|e| RpcError::internal_error(e.to_string()))
         }
 
+        "has_codex_unify_history_backup" => Ok(serde_json::json!(
+            cc_switch_core::has_codex_unify_history_backup()
+        )),
+
+        "restore_codex_unified_history" => cc_switch_core::restore_codex_unified_history()
+            .await
+            .map_err(RpcError::app_error),
+
         "save_settings" => {
             let settings_value = params
                 .get("settings")
@@ -1610,7 +1676,9 @@ pub async fn dispatch_command(
                     RpcError::invalid_params(format!("invalid 'settings' value: {e}"))
                 })?;
 
-            let ok = cc_switch_core::save_settings(settings).map_err(RpcError::app_error)?;
+            let ok = cc_switch_core::save_settings(core, settings)
+                .await
+                .map_err(RpcError::app_error)?;
             Ok(serde_json::json!(ok))
         }
 
@@ -2901,6 +2969,73 @@ pub async fn dispatch_command(
         // ========================
         // Prompt commands
         // ========================
+        "list_profiles" => {
+            let response = cc_switch_core::list_profiles(core).map_err(RpcError::app_error)?;
+            serde_json::to_value(response).map_err(|e| RpcError::internal_error(e.to_string()))
+        }
+
+        "create_profile" => {
+            let name = get_str_param(params, &["name"])?;
+            let scope = get_str_param(params, &["scope"])?;
+            let profile =
+                cc_switch_core::create_profile(core, name, scope).map_err(RpcError::app_error)?;
+            serde_json::to_value(profile).map_err(|e| RpcError::internal_error(e.to_string()))
+        }
+
+        "update_profile" => {
+            let id = get_str_param(params, &["id"])?;
+            let name = get_optional_str_param(params, &["name"])?.map(str::to_string);
+            let resnapshot = params
+                .get("resnapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let scope = get_optional_str_param(params, &["scope"])?;
+            let profile = cc_switch_core::update_profile(core, id, name, resnapshot, scope)
+                .map_err(RpcError::app_error)?;
+            serde_json::to_value(profile).map_err(|e| RpcError::internal_error(e.to_string()))
+        }
+
+        "delete_profile" => {
+            let id = get_str_param(params, &["id"])?;
+            cc_switch_core::delete_profile(core, id).map_err(RpcError::app_error)?;
+            Ok(Value::Null)
+        }
+
+        "clear_current_profile" => {
+            let scope = get_str_param(params, &["scope"])?;
+            cc_switch_core::clear_current_profile(core, scope).map_err(RpcError::app_error)?;
+            Ok(Value::Null)
+        }
+
+        "apply_profile" => {
+            let id = get_str_param(params, &["id"])?;
+            let scope = get_str_param(params, &["scope"])?;
+            let (warnings, parsed_scope) = cc_switch_core::apply_profile(core, id, scope)
+                .await
+                .map_err(RpcError::app_error)?;
+            for app in parsed_scope.apps() {
+                let provider_id =
+                    cc_switch_core::get_effective_current_provider(core, app.as_str())
+                        .map_err(RpcError::app_error)?;
+                let (proxy_enabled, auto_failover_enabled) =
+                    cc_switch_core::get_proxy_flags(core, app.as_str());
+                let _ = state.event_bus.send(ServerEvent {
+                    name: "provider-switched".to_string(),
+                    payload: serde_json::json!({
+                        "appType": app.as_str(),
+                        "providerId": provider_id,
+                        "proxyEnabled": proxy_enabled,
+                        "autoFailoverEnabled": auto_failover_enabled,
+                    }),
+                });
+            }
+            let _ = state.event_bus.send(ServerEvent {
+                name: "profile-applied".to_string(),
+                payload: serde_json::json!({ "profileId": id, "scope": parsed_scope.as_str() }),
+            });
+            Ok(serde_json::json!(warnings))
+        }
+
         "get_prompts" => {
             let app = params
                 .get("app")
@@ -3081,6 +3216,52 @@ pub async fn dispatch_command(
         // ========================
         // DeepLink commands
         // ========================
+        "s3_test_connection" => {
+            let settings_value = params
+                .get("settings")
+                .ok_or_else(|| RpcError::invalid_params("missing 'settings' field"))?;
+            let settings: cc_switch_core::S3SyncSettings =
+                serde_json::from_value(settings_value.clone()).map_err(|e| {
+                    RpcError::invalid_params(format!("invalid 'settings' value: {e}"))
+                })?;
+            let preserve_empty = params
+                .get("preserveEmptyPassword")
+                .or_else(|| params.get("preserve_empty_password"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            cc_switch_core::s3_test_connection(settings, preserve_empty)
+                .await
+                .map_err(RpcError::app_error)
+        }
+
+        "s3_sync_upload" => cc_switch_core::s3_sync_upload(core)
+            .await
+            .map_err(RpcError::app_error),
+
+        "s3_sync_download" => cc_switch_core::s3_sync_download(core)
+            .await
+            .map_err(RpcError::app_error),
+
+        "s3_sync_save_settings" => {
+            let settings_value = params
+                .get("settings")
+                .ok_or_else(|| RpcError::invalid_params("missing 'settings' field"))?;
+            let settings: cc_switch_core::S3SyncSettings =
+                serde_json::from_value(settings_value.clone()).map_err(|e| {
+                    RpcError::invalid_params(format!("invalid 'settings' value: {e}"))
+                })?;
+            let touched = params
+                .get("passwordTouched")
+                .or_else(|| params.get("password_touched"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            cc_switch_core::s3_sync_save_settings(settings, touched).map_err(RpcError::app_error)
+        }
+
+        "s3_sync_fetch_remote_info" => cc_switch_core::s3_sync_fetch_remote_info()
+            .await
+            .map_err(RpcError::app_error),
+
         "parse_deeplink" => {
             let url = params
                 .get("url")

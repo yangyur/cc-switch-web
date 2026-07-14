@@ -49,7 +49,8 @@ fn dispatch_match_methods() -> BTreeSet<String> {
     methods
 }
 
-const FRONTEND_DESKTOP_ONLY_METHODS: &[&str] = &[];
+const FRONTEND_DESKTOP_ONLY_METHODS: &[&str] =
+    &["check_app_update_available", "install_update_and_restart"];
 
 fn collect_source_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     let entries =
