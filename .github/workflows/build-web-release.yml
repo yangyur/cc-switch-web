@@ -187,12 +187,119 @@ jobs:
           path: release-assets/
           retention-days: 7
 
+  build-web-el8:
+    name: Build Web (Linux x86_64 (EL8))
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/centos/centos:stream8
+      options: --user root
+
+    steps:
+      - name: Install EL8 build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # CentOS Stream 8 repos are archived; switch to vault mirrors if needed
+          sed -i 's|^mirrorlist=|#mirrorlist=|g; s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/*.repo || true
+          dnf clean all
+          dnf -y update
+          dnf -y groupinstall "Development Tools"
+          dnf -y install \
+            ca-certificates \
+            curl \
+            git \
+            perl \
+            pkgconfig \
+            openssl-devel
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Enable Corepack
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@${PNPM_VERSION} --activate
+          pnpm --version
+
+      - name: Setup pnpm cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Resolve release metadata
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(node -p "require('./package.json').version")"
+          fi
+
+          ASSET_NAME="cc-switch-web-v${VERSION}-linux-x86_64-el8"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (Web mode)
+        shell: bash
+        run: pnpm build:web
+
+      - name: Verify frontend build
+        shell: bash
+        run: |
+          test -f dist/index.html
+          ls -la dist/
+
+      - name: Build backend (Release mode)
+        shell: bash
+        run: cargo build --release --manifest-path crates/server/Cargo.toml
+
+      - name: Verify backend binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lah crates/server/target/release/cc-switch-web
+          file crates/server/target/release/cc-switch-web
+          ldd crates/server/target/release/cc-switch-web || true
+
+      - name: Create release asset
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp crates/server/target/release/cc-switch-web "release-assets/${ASSET_NAME}"
+          chmod +x "release-assets/${ASSET_NAME}"
+          ls -lah release-assets/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-el8
+          path: release-assets/
+          retention-days: 7
+
   release:
     name: Publish Web release assets
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - build-web-windows
       - build-web-linux
+      - build-web-el8
     runs-on: ubuntu-latest
 
     steps:
@@ -206,6 +313,7 @@ jobs:
         shell: bash
         run: |
           chmod +x release-assets/cc-switch-web-v${GITHUB_REF_NAME#v}-linux-x86_64-ubuntu20.04
+          chmod +x release-assets/cc-switch-web-v${GITHUB_REF_NAME#v}-linux-x86_64-el8
           ls -lah release-assets/
 
       - name: Create release notes
@@ -217,7 +325,8 @@ jobs:
             printf '%s\n\n' 'Official GitHub Releases now publish the Web runtime only.'
             printf '%s\n' '### Assets'
             printf -- '- Windows x86_64: `cc-switch-web-v%s-windows-x86_64.exe`\n' "$VERSION"
-            printf -- '- Linux x86_64 baseline: `cc-switch-web-v%s-linux-x86_64-ubuntu20.04` (built in an Ubuntu 20.04 container on an ubuntu-22.04 runner)\n\n' "$VERSION"
+            printf -- '- Linux x86_64 (Ubuntu 20.04 baseline): `cc-switch-web-v%s-linux-x86_64-ubuntu20.04` (built in an Ubuntu 20.04 container on an ubuntu-22.04 runner)\n' "$VERSION"
+            printf -- '- Linux x86_64 (EL8 baseline): `cc-switch-web-v%s-linux-x86_64-el8` (built in a CentOS Stream 8 container, glibc >= 2.28)\n\n' "$VERSION"
             printf '%s\n' '### Quick start'
             printf -- '- Windows: run `cc-switch-web-v%s-windows-x86_64.exe`\n' "$VERSION"
             printf -- '- Linux: `chmod +x ./cc-switch-web-v%s-linux-x86_64-ubuntu20.04 && ./cc-switch-web-v%s-linux-x86_64-ubuntu20.04`\n\n' "$VERSION" "$VERSION"
