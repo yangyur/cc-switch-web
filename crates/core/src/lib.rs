@@ -1715,6 +1715,15 @@ pub fn get_config_status(app: &str) -> Result<ConfigStatus, String> {
                 path: cc_switch::get_openclaw_dir().to_string_lossy().to_string(),
             }
         }
+        AppType::GrokBuild => {
+            let config_path = cc_switch::get_grok_config_path();
+            ConfigStatus {
+                exists: config_path.exists(),
+                path: cc_switch::get_grok_config_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            }
+        }
         AppType::ClaudeDesktop | AppType::Hermes => ConfigStatus {
             exists: false,
             path: String::new(),
@@ -1756,6 +1765,7 @@ pub fn get_config_dir(app: &str) -> Result<String, String> {
         AppType::Gemini => cc_switch::get_gemini_dir(),
         AppType::OpenCode => cc_switch::get_opencode_dir(),
         AppType::OpenClaw => cc_switch::get_openclaw_dir(),
+        AppType::GrokBuild => cc_switch::get_grok_config_dir(),
         AppType::ClaudeDesktop | AppType::Hermes => {
             return Err(format!("配置目录不适用于 {app}"));
         }

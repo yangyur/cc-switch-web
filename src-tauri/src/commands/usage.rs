@@ -2,6 +2,7 @@
 
 use crate::database::Database;
 use crate::error::AppError;
+use crate::services::model_pricing::{ModelPricingInfo, ModelsDevSyncConfig, ModelsDevSyncState};
 use crate::services::usage_stats::*;
 #[cfg(feature = "desktop")]
 use crate::store::AppState;
@@ -132,9 +133,11 @@ pub fn get_request_detail(
 pub fn list_model_pricing(db: &Database) -> Result<Vec<ModelPricingInfo>, AppError> {
     log::info!("获取模型定价列表");
     db.ensure_model_pricing_seeded()?;
+    crate::services::model_pricing::sync_local_model_pricing(db)?;
 
     let conn = crate::database::lock_conn!(db.conn);
 
+    // 检查表是否存在
     let table_exists: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_pricing'",
@@ -185,51 +188,20 @@ pub fn upsert_model_pricing(
     cache_read_cost: String,
     cache_creation_cost: String,
 ) -> Result<(), AppError> {
-    let conn = crate::database::lock_conn!(db.conn);
-    conn.execute(
-        "INSERT OR REPLACE INTO model_pricing (
-            model_id, display_name, input_cost_per_million, output_cost_per_million,
-            cache_read_cost_per_million, cache_creation_cost_per_million
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
+    crate::services::model_pricing::update_model_pricing(
+        db,
+        ModelPricingInfo {
             model_id,
             display_name,
-            input_cost,
-            output_cost,
-            cache_read_cost,
-            cache_creation_cost
-        ],
+            input_cost_per_million: input_cost,
+            output_cost_per_million: output_cost,
+            cache_read_cost_per_million: cache_read_cost,
+            cache_creation_cost_per_million: cache_creation_cost,
+        },
     )
-    .map_err(|e| AppError::Database(format!("更新模型定价失败: {e}")))?;
-
-    if let Err(e) = db.backfill_missing_usage_costs_for_model(&model_id) {
-        log::warn!("模型定价更新后回填历史用量成本失败 (model_id={model_id}): {e}");
-    }
-
-    Ok(())
+    .map(|_| ())
 }
 
-/// 删除模型定价
-pub fn remove_model_pricing(db: &Database, model_id: String) -> Result<(), AppError> {
-    let conn = crate::database::lock_conn!(db.conn);
-
-    conn.execute(
-        "DELETE FROM model_pricing WHERE model_id = ?1",
-        rusqlite::params![model_id.clone()],
-    )
-    .map_err(|e| AppError::Database(format!("删除模型定价失败: {e}")))?;
-
-    log::info!("已删除模型定价: {model_id}");
-    Ok(())
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn get_model_pricing(state: State<'_, AppState>) -> Result<Vec<ModelPricingInfo>, AppError> {
-    list_model_pricing(&state.db)
-}
-
-/// 更新模型定价
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn update_model_pricing(
@@ -252,6 +224,43 @@ pub fn update_model_pricing(
     )
 }
 
+/// 批量更新模型定价（models.dev 自动同步仅触发一次历史成本回填）
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn update_model_pricing_batch(
+    state: State<'_, AppState>,
+    entries: Vec<ModelPricingInfo>,
+) -> Result<usize, AppError> {
+    crate::services::model_pricing::update_model_pricing_batch(&state.db, entries)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn get_models_dev_sync_config(
+    state: State<'_, AppState>,
+) -> Result<ModelsDevSyncState, AppError> {
+    crate::services::model_pricing::get_models_dev_sync_state(&state.db)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn save_models_dev_sync_config(
+    state: State<'_, AppState>,
+    config: ModelsDevSyncConfig,
+) -> Result<(), AppError> {
+    crate::services::model_pricing::save_models_dev_sync_config(&state.db, config)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn record_models_dev_sync_result(
+    state: State<'_, AppState>,
+    synced_at: Option<i64>,
+    error: Option<String>,
+) -> Result<(), AppError> {
+    crate::services::model_pricing::record_models_dev_sync_result(&state.db, synced_at, error)
+}
+
 /// 检查 Provider 使用限额
 #[cfg(feature = "desktop")]
 #[tauri::command]
@@ -264,61 +273,69 @@ pub fn check_provider_limits(
 }
 
 /// 删除模型定价
+pub fn remove_model_pricing(db: &Database, model_id: String) -> Result<(), AppError> {
+    crate::services::model_pricing::delete_model_pricing(db, &model_id)?;
+    log::info!("已删除模型定价: {model_id}");
+    Ok(())
+}
+
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub fn delete_model_pricing(state: State<'_, AppState>, model_id: String) -> Result<(), AppError> {
     remove_model_pricing(&state.db, model_id)
 }
 
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn get_model_pricing(state: State<'_, AppState>) -> Result<Vec<ModelPricingInfo>, AppError> {
+    list_model_pricing(&state.db)
+}
+
 /// 手动触发会话日志同步
 #[cfg(feature = "desktop")]
 #[tauri::command]
-pub fn sync_session_usage(
+pub async fn sync_session_usage(
     state: State<'_, AppState>,
 ) -> Result<crate::services::session_usage::SessionSyncResult, AppError> {
-    // 同步 Claude 会话日志
-    let mut result = crate::services::session_usage::sync_claude_session_logs(&state.db)?;
+    let db = state.db.clone();
+    let _guard = crate::services::session_usage::session_sync_mutex()
+        .lock()
+        .await;
+    tokio::task::spawn_blocking(move || {
+        crate::services::session_usage::sync_all_unlocked(&db)
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("会话用量同步任务失败: {error}")))
+}
 
-    // 同步 Codex 使用数据
-    match crate::services::session_usage_codex::sync_codex_usage(&state.db) {
-        Ok(codex_result) => {
-            result.imported += codex_result.imported;
-            result.skipped += codex_result.skipped;
-            result.files_scanned += codex_result.files_scanned;
-            result.errors.extend(codex_result.errors);
-        }
-        Err(e) => {
-            result.errors.push(format!("Codex 同步失败: {e}"));
-        }
-    }
+/// Codex reset 成功后，无论重导是否导入新行或返回错误，都必须通知前端刷新。
+/// 调用方应只在 reset 成功后调用，避免把未发生的数据变更误报为重建完成。
+fn finish_codex_rebuild(
+    result: Result<crate::services::session_usage::SessionSyncResult, AppError>,
+) -> Result<crate::services::session_usage::SessionSyncResult, AppError> {
+    crate::usage_events::notify_log_recorded();
+    result
+}
 
-    // 同步 Gemini 使用数据
-    match crate::services::session_usage_gemini::sync_gemini_usage(&state.db) {
-        Ok(gemini_result) => {
-            result.imported += gemini_result.imported;
-            result.skipped += gemini_result.skipped;
-            result.files_scanned += gemini_result.files_scanned;
-            result.errors.extend(gemini_result.errors);
-        }
-        Err(e) => {
-            result.errors.push(format!("Gemini 同步失败: {e}"));
-        }
-    }
-
-    // 同步 OpenCode 使用数据
-    match crate::services::session_usage_opencode::sync_opencode_usage(&state.db) {
-        Ok(opencode_result) => {
-            result.imported += opencode_result.imported;
-            result.skipped += opencode_result.skipped;
-            result.files_scanned += opencode_result.files_scanned;
-            result.errors.extend(opencode_result.errors);
-        }
-        Err(e) => {
-            result.errors.push(format!("OpenCode 同步失败: {e}"));
-        }
-    }
-
-    Ok(result)
+/// 备份数据库后，仅重建 Codex session 用量。锁覆盖 backup → reset → import
+/// 整个序列，避免后台同步在清理和重导之间插入数据。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn rebuild_codex_usage(
+    state: State<'_, AppState>,
+) -> Result<crate::services::session_usage::SessionSyncResult, AppError> {
+    let db = state.db.clone();
+    let _guard = crate::services::session_usage::session_sync_mutex()
+        .lock()
+        .await;
+    tokio::task::spawn_blocking(move || {
+        db.backup_database_file()?;
+        db.reset_codex_usage()?;
+        let result = crate::services::session_usage_codex::sync_codex_usage(&db);
+        finish_codex_rebuild(result)
+    })
+    .await
+    .map_err(|error| AppError::Message(format!("Codex 用量重建任务失败: {error}")))?
 }
 
 /// 获取数据来源分布
@@ -330,14 +347,32 @@ pub fn get_usage_data_sources(
     crate::services::session_usage::get_data_source_breakdown(&state.db)
 }
 
-/// 模型定价信息
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelPricingInfo {
-    pub model_id: String,
-    pub display_name: String,
-    pub input_cost_per_million: String,
-    pub output_cost_per_million: String,
-    pub cache_read_cost_per_million: String,
-    pub cache_creation_cost_per_million: String,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_rebuild_notifies_when_reimport_is_empty() {
+        crate::usage_events::take_test_notify_count();
+
+        let result = finish_codex_rebuild(Ok(
+            crate::services::session_usage::SessionSyncResult::default(),
+        ))
+        .expect("空重导应成功");
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(crate::usage_events::take_test_notify_count(), 1);
+    }
+
+    #[test]
+    fn codex_rebuild_notifies_when_reimport_fails_after_reset() {
+        crate::usage_events::take_test_notify_count();
+
+        let result = finish_codex_rebuild(Err(AppError::Message(
+            "synthetic reimport failure".to_string(),
+        )));
+
+        assert!(result.is_err());
+        assert_eq!(crate::usage_events::take_test_notify_count(), 1);
+    }
 }
